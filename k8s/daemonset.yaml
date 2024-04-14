@@ -1,0 +1,21 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: gcore-agent
+spec:
+  selector:
+    matchLabels:
+      name: gcore-agent
+  template:
+    metadata:
+      labels:
+        name: gcore-agent
+    spec:
+      hostPID: true
+      containers:
+      - name: gcore-agent
+        image: <gcore-image-path>
+        command: ["/bin/sh"]
+        args: ["-c", "while true; do sleep 3600; done"]
+        securityContext:
+          privileged: true
