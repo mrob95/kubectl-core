@@ -22,6 +22,9 @@ HOST_PID=$(kubectl exec -it "$DAEMONSET_POD_NAME" -- nsenter -t 1 --mount crictl
 BINARY_NAME=$(kubectl exec -it "$DAEMONSET_POD_NAME" -- ps -p "$HOST_PID" -o cmd= | awk '{print $1}')
 
 CURTIME=$(date "+%Y%m%d-%H%M%S")
+CORE_FILE_PATH="/tmp/core.$HOST_PID"
+LOCAL_CORE_DUMP_PATH="./$TARGET_POD_NAME-$CURTIME-core.gz"
+LOCAL_BINARY_PATH="$TARGET_POD_NAME-$CURTIME-binary"
 
 echo "Target Pod:       $TARGET_POD_NAME"
 echo "Container Name:   $CONTAINER_NAME"
@@ -41,38 +44,34 @@ if [ "$proceed" != "y" ]; then
 fi
 echo ""
 
-echo "Cleaning up previous core dumps..."
+cleanup_core_dumps() {
+    echo "Cleaning up core dumps..."
+    kubectl exec -it "$DAEMONSET_POD_NAME" -- sh -c 'rm -f /tmp/core*'
+}
 
-kubectl exec -it "$DAEMONSET_POD_NAME" -- sh -c 'rm -f /tmp/core*'
+create_core_dump() {
+    echo "Creating core dump..."
+    kubectl exec -it "$DAEMONSET_POD_NAME" -- gcore -o /tmp/core "$HOST_PID"
+}
 
-echo "Creating core dump..."
+copy_core_dump_to_local() {
+    # NOTE: core dumps seem to be large but very sparse, so compressing them is very effective.
+    # Presumably this is due to large unbacked virtual memory allocations by the Go runtime.
+    echo "Copying core dump to local..."
+    kubectl exec -it "$DAEMONSET_POD_NAME" -- gzip "$CORE_FILE_PATH"
+    kubectl cp "$DAEMONSET_POD_NAME:$CORE_FILE_PATH.gz" "$LOCAL_CORE_DUMP_PATH" > /dev/null
+    gzip -d "$LOCAL_CORE_DUMP_PATH"
+    echo "Core dump saved to $TARGET_POD_NAME-$CURTIME-core"
+}
 
-kubectl exec -it "$DAEMONSET_POD_NAME" -- gcore -o /tmp/core "$HOST_PID"
+copy_binary_to_local() {
+    echo "Copying application binary to local..."
+    kubectl cp "$TARGET_POD_NAME:$BINARY_NAME" "$LOCAL_BINARY_PATH" > /dev/null
+    echo "Binary saved to $LOCAL_BINARY_PATH"
+}
 
-echo "Compressing core dump..."
-
-kubectl exec -it "$DAEMONSET_POD_NAME" -- gzip "/tmp/core.$HOST_PID"
-
-echo "Copying core dump to local..."
-
-kubectl cp "$DAEMONSET_POD_NAME:/tmp/core.$HOST_PID.gz" "$TARGET_POD_NAME-$CURTIME-core.gz" 2>/dev/null
-gzip -d "./$TARGET_POD_NAME-$CURTIME-core.gz"
-
-echo "Core dump saved to $TARGET_POD_NAME-$CURTIME-core"
-
-echo "Cleaning up core dump..."
-
-kubectl exec -it "$DAEMONSET_POD_NAME" -- sh -c 'rm -f /tmp/core*'
-
-echo "Copying application binary to local..."
-
-kubectl cp "$TARGET_POD_NAME:$BINARY_NAME" "$TARGET_POD_NAME-$CURTIME-binary" 2>/dev/null
-
-echo "Binary saved to $TARGET_POD_NAME-$CURTIME-binary"
-
-echo ""
-
-cat <<EOF
+print_instructions() {
+    cat <<EOF
 To analyse the core dump using VSCode, add the following to your launch.json:
 
 {
@@ -94,7 +93,17 @@ To analyse the core dump using VSCode, add the following to your launch.json:
     ]
 }
 
+Happy hunting!
 EOF
+}
 
+main() {
+    cleanup_core_dumps
+    create_core_dump
+    copy_core_dump_to_local
+    cleanup_core_dumps
+    copy_binary_to_local
+    print_instructions
+}
 
-echo "Happy hunting!"
+main
