@@ -1,0 +1,100 @@
+#!/bin/bash
+
+# This script creates a core dump of a Go process running in a Kubernetes pod.
+# It assumes the following:
+#   - The target pod is running a single container.
+#   - A gcore-agent DaemonSet is deployed in the cluster, with hostpid, elevated permissions and gdb/gzip installed.
+#   - It is being run from a directory containing the source code.
+#   - When the code was built, the source code was located in /app
+#   - The Go modules cache is located in $HOME/go/pkg/mod
+
+set -eo pipefail
+
+TARGET_POD_NAME=$1
+NODE_NAME=$(kubectl get pod "$TARGET_POD_NAME" -o jsonpath='{.spec.nodeName}')
+
+DAEMONSET_POD_NAME=$(kubectl get pods -l name=gcore-agent "--field-selector=spec.nodeName=$NODE_NAME" -o jsonpath='{.items[0].metadata.name}')
+
+CONTAINER_NAME=$(kubectl get pod "$TARGET_POD_NAME" -o jsonpath='{.status.containerStatuses[0].name}')
+CONTAINER_ID=$(kubectl get pod "$TARGET_POD_NAME" -o jsonpath='{.status.containerStatuses[0].containerID}' | cut -d'/' -f3)
+
+HOST_PID=$(kubectl exec -it "$DAEMONSET_POD_NAME" -- nsenter -t 1 --mount crictl inspect  -o go-template --template '{{.info.pid}}' "$CONTAINER_ID" | tr -d '\r')
+BINARY_NAME=$(kubectl exec -it "$DAEMONSET_POD_NAME" -- ps -p "$HOST_PID" -o cmd= | awk '{print $1}')
+
+CURTIME=$(date "+%Y%m%d-%H%M%S")
+
+echo "Target Pod:       $TARGET_POD_NAME"
+echo "Container Name:   $CONTAINER_NAME"
+echo "Container ID:     $CONTAINER_ID"
+echo "Node Name:        $NODE_NAME"
+echo "DaemonSet Pod:    $DAEMONSET_POD_NAME"
+echo "Host PID:         $HOST_PID"
+echo "Binary Name:      $BINARY_NAME"
+
+echo ""
+echo "This script will create a core dump of the process running in the target pod."
+echo "Proceed? (y/n)"
+read -r proceed
+if [ "$proceed" != "y" ]; then
+    echo "Aborted."
+    exit 1
+fi
+echo ""
+
+echo "Cleaning up previous core dumps..."
+
+kubectl exec -it "$DAEMONSET_POD_NAME" -- sh -c 'rm -f /tmp/core*'
+
+echo "Creating core dump..."
+
+kubectl exec -it "$DAEMONSET_POD_NAME" -- gcore -o /tmp/core "$HOST_PID"
+
+echo "Compressing core dump..."
+
+kubectl exec -it "$DAEMONSET_POD_NAME" -- gzip "/tmp/core.$HOST_PID"
+
+echo "Copying core dump to local..."
+
+kubectl cp "$DAEMONSET_POD_NAME:/tmp/core.$HOST_PID.gz" "$TARGET_POD_NAME-$CURTIME-core.gz" 2>/dev/null
+gzip -d "./$TARGET_POD_NAME-$CURTIME-core.gz"
+
+echo "Core dump saved to $TARGET_POD_NAME-$CURTIME-core"
+
+echo "Cleaning up core dump..."
+
+kubectl exec -it "$DAEMONSET_POD_NAME" -- sh -c 'rm -f /tmp/core*'
+
+echo "Copying application binary to local..."
+
+kubectl cp "$TARGET_POD_NAME:$BINARY_NAME" "$TARGET_POD_NAME-$CURTIME-binary" 2>/dev/null
+
+echo "Binary saved to $TARGET_POD_NAME-$CURTIME-binary"
+
+echo ""
+
+cat <<EOF
+To analyse the core dump using VSCode, add the following to your launch.json:
+
+{
+    "name": "Core file $TARGET_POD_NAME-$CURTIME-core",
+    "type": "go",
+    "request": "launch",
+    "mode": "core",
+    "program":"$(pwd)/$TARGET_POD_NAME-$CURTIME-binary",
+    "coreFilePath":"$(pwd)/$TARGET_POD_NAME-$CURTIME-core",
+    "substitutePath": [
+        {
+            "from": "\${workspaceFolder}",
+            "to": "/app"
+        },
+        {
+            "from": "$HOME/go/pkg/mod",
+            "to": "/go/pkg/mod"
+        }
+    ]
+}
+
+EOF
+
+
+echo "Happy hunting!"
